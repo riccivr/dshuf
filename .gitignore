@@ -1,0 +1,11 @@
+dshuf
+*.o
+*.so
+*.dll
+*.dylib
+*.wasm
+*.tar.gz
+tests/test_dshuf
+tests/test_cpp
+__pycache__/
+*.pyc

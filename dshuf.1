@@ -1,0 +1,87 @@
+.TH DSHUF 1 dshuf\-VERSION
+.SH NAME
+dshuf \- suckless multi-key low-discrepancy shuffler
+.SH SYNOPSIS
+.B dshuf
+.RB [ \-Shvz ]
+.RB [ \-k
+.IR field[:weight] ]
+.RB [ \-d
+.IR delim ]
+.RB [ \-j
+.IR jitter ]
+.RB [ \-w
+.IR window ]
+.RB [ \-s
+.IR seed ]
+.RB [ \-n
+.IR count ]
+.RI [ file\ ... ]
+.SH DESCRIPTION
+.B dshuf
+shuffles lines from standard input or files using low-discrepancy spacing with controllable jitter.
+It solves the clustering and starvation problems of standard random shuffling by separating items
+that share attribute keys (such as artist, album, or genre) while preserving pseudo-randomness.
+.P
+If no
+.I file
+operands are specified, or if a file operand is
+.BR \- ,
+.B dshuf
+reads from standard input.
+.SH OPTIONS
+.TP
+.BI \-k " field[:weight]"
+Specify a 1-based column index to cluster on, and an optional floating-point repulsion weight (default 1.0 for primary, decaying for subsequent keys).
+This option may be given multiple times to configure multi-key hierarchical clustering.
+.TP
+.BI \-d " delim"
+Set the field delimiter character (default is tab \fB\\t\fR).
+.TP
+.BI \-j " jitter"
+Tune the randomness factor between 0.0 (strictly optimal spacing) and 1.0 (pure random shuffle). Default is 0.20.
+.TP
+.BI \-w " window"
+Set the sliding window buffer size for distance tracking and streaming mode. Default is 256.
+.TP
+.B \-S
+Force streaming mode. Emits lines through the sliding window as they arrive from input without loading the entire stream into memory.
+.TP
+.BI \-s " seed"
+Set an explicit 64-bit seed for deterministic, reproducible shuffles. If omitted, entropy is read from /dev/urandom or system timers.
+.TP
+.BI \-n " count"
+Output at most
+.I count
+lines.
+.TP
+.B \-z
+Treat input and output lines as terminated by a NUL byte rather than a newline.
+.TP
+.B \-v
+Print version information to standard error and exit.
+.TP
+.B \-h
+Print usage summary to standard error and exit.
+.SH EXAMPLES
+Shuffle a tab-separated music collection by artist (column 1):
+.IP
+.B dshuf -k 1 playlist.tsv
+.PP
+Multi-key shuffle by artist (col 1) and album (col 2) with custom weights:
+.IP
+.B dshuf -k 1:1.0 -k 2:0.5 playlist.tsv
+.PP
+Stream an endless pipe with bounded memory:
+.IP
+.B cat stream.tsv | dshuf -k 1 -S -w 128
+.PP
+Reproducible shuffle using an explicit seed:
+.IP
+.B dshuf -k 1 -s 1337 playlist.tsv
+.SH SEE ALSO
+.BR shuf (1),
+.BR sort (1),
+.BR cut (1)
+.SH AUTHORS
+Ricardo Veronese Ricci
