@@ -79,8 +79,18 @@ interface WindowItem<T> {
   age: number;
 }
 
+interface Slot {
+  count: number;
+  lastStep: number;
+}
+
+function slotKey(level: number, value: number): string {
+  return level + ":" + (value >>> 0);
+}
+
 /**
  * Streaming shuffler maintaining bounded sliding window memory.
+ * Key counts and last-emit distances are O(1) map lookups, matching dshuf.h.
  */
 export class Stream<T> {
   private windowCap: number;
@@ -90,9 +100,9 @@ export class Stream<T> {
   private jitter: number;
   private beta: number;
   private rng: Prng;
-
   private historyCap: number;
-  private historyKeys: number[][] = [];
+  private stepCount = 1;
+  private map = new Map<string, Slot>();
 
   constructor(options: ShuffleOptions<T> = {}) {
     this.windowCap = options.windowSize || 256;
@@ -105,6 +115,27 @@ export class Stream<T> {
     this.historyCap = this.windowCap;
   }
 
+  private bump(level: number, value: number, delta: number): Slot {
+    const id = slotKey(level, value);
+    let slot = this.map.get(id);
+    if (!slot) {
+      slot = { count: 0, lastStep: 0 };
+      this.map.set(id, slot);
+    }
+    slot.count += delta;
+    if (slot.count < 0) slot.count = 0;
+    return slot;
+  }
+
+  private forgetStale(): void {
+    if (this.map.size <= this.windowCap * this.numKeys * 4) return;
+    for (const [id, slot] of this.map) {
+      if (slot.count === 0 && (slot.lastStep === 0 || this.stepCount - slot.lastStep > this.historyCap)) {
+        this.map.delete(id);
+      }
+    }
+  }
+
   /** Returns false when the window is at capacity (strictly bounded). */
   push(item: T, keys?: (string | number)[]): boolean {
     if (this.window.length >= this.windowCap) return false;
@@ -113,6 +144,9 @@ export class Stream<T> {
       for (const k of keys) {
         numericKeys.push(typeof k === "number" ? k >>> 0 : hashString(String(k)));
       }
+    }
+    for (let k = 0; k < numericKeys.length; k++) {
+      this.bump(k, numericKeys[k], 1);
     }
 
     this.window.push({
@@ -123,19 +157,28 @@ export class Stream<T> {
     return true;
   }
 
+  private commit(it: WindowItem<T>): void {
+    for (let k = 0; k < it.keys.length; k++) {
+      const slot = this.bump(k, it.keys[k], -1);
+      slot.lastStep = this.stepCount;
+    }
+    this.stepCount++;
+    this.forgetStale();
+  }
+
   pop(): T | undefined {
     if (this.window.length === 0) return undefined;
 
     if (this.window.length === 1) {
       const it = this.window.shift()!;
-      this.recordHistory(it.keys);
+      this.commit(it);
       return it.item;
     }
 
     if (this.jitter >= 1.0) {
       const pick = this.rng.bounded(this.window.length);
       const chosen = this.window.splice(pick, 1)[0];
-      this.recordHistory(chosen.keys);
+      this.commit(chosen);
       return chosen.item;
     }
 
@@ -150,19 +193,17 @@ export class Stream<T> {
       for (let k = 0; k < it.keys.length; k++) {
         const kval = it.keys[k];
         const weight = this.weights[k] ?? Math.pow(0.5, k);
-
-        let countK = 0;
-        for (let j = 0; j < this.window.length; j++) {
-          if (this.window[j].keys[k] === kval) countK++;
-        }
-
-        const idealSpacing = this.window.length / (countK > 0 ? countK : 1);
-        const dist = this.findHistoryDist(k, kval);
+        const slot = this.map.get(slotKey(k, kval));
+        const countK = slot && slot.count > 0 ? slot.count : 1;
+        const idealSpacing = Math.max(1, this.window.length / countK);
 
         let dev = 0;
-        if (dist > 0) {
-          dev = (idealSpacing - dist) / idealSpacing;
-          if (dev < -1.0) dev = -1.0;
+        if (slot && slot.lastStep > 0) {
+          const dist = this.stepCount - slot.lastStep;
+          if (dist <= this.historyCap) {
+            dev = (idealSpacing - dist) / idealSpacing;
+            if (dev < -1.0) dev = -1.0;
+          }
         }
         penalty += weight * dev;
       }
@@ -178,37 +219,18 @@ export class Stream<T> {
       }
     }
 
-    // Age remaining items
     for (let i = 0; i < this.window.length; i++) {
       if (i !== bestIdx) this.window[i].age++;
     }
 
     const chosen = this.window[bestIdx];
-    this.recordHistory(chosen.keys);
+    this.commit(chosen);
     this.window.splice(bestIdx, 1);
     return chosen.item;
   }
 
   get count(): number {
     return this.window.length;
-  }
-
-  private recordHistory(keys: number[]): void {
-    if (keys.length === 0) return;
-    this.historyKeys.push([...keys]);
-    if (this.historyKeys.length > this.historyCap) {
-      this.historyKeys.shift();
-    }
-  }
-
-  private findHistoryDist(keyLevel: number, keyVal: number): number {
-    for (let d = 1; d <= this.historyKeys.length; d++) {
-      const slot = this.historyKeys.length - d;
-      if (this.historyKeys[slot][keyLevel] === keyVal) {
-        return d;
-      }
-    }
-    return 0;
   }
 }
 
@@ -224,7 +246,7 @@ export function shuffle<T>(items: T[], options: ShuffleOptions<T> = {}): T[] {
   // Step 1: Initial Fisher-Yates
   const indices = Array.from({ length: n }, (_, i) => i);
   for (let i = n - 1; i > 0; i--) {
-    const j = rng.nextUint32() % (i + 1);
+    const j = rng.bounded(i + 1);
     const tmp = indices[i];
     indices[i] = indices[j];
     indices[j] = tmp;

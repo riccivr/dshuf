@@ -97,8 +97,17 @@ case "$NUL_OUT" in
 esac
 
 echo "Test 8: Early exit leak check in streaming mode (-S -n 10)"
-yes "Band\tSong" | head -n 500 | $DSHUF -k 1 -S -w 32 -n 10 > /dev/null
+yes "Band	Song" | head -n 500 | $DSHUF -k 1 -S -w 32 -n 10 > /dev/null
 echo "  [PASS] Early exit without leak"
+
+echo "Test 9: Output is a permutation of input"
+SORT_IN=$(sort "$TMPDATA")
+SORT_OUT=$($DSHUF -k 1 -s 99 "$TMPDATA" | sort)
+if [ "$SORT_IN" != "$SORT_OUT" ]; then
+    echo "FAILED: shuffled output is not a permutation of input"
+    exit 1
+fi
+echo "  [PASS] Batch output is a permutation of input"
 
 # Clean up temporary test files
 rm -f "$TMPDATA" tests/tmp_shuffled.tsv tests/tmp_colon.txt

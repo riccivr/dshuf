@@ -220,6 +220,68 @@ static void test_map_eviction_unique_keys(void) {
     printf("  [PASS] Map eviction under unique-key flood (%zu items)\n", total);
 }
 
+static size_t map_live_count(const dshuf_stream_t *s) {
+    size_t sum = 0;
+    if (!s->map) return 0;
+    for (size_t i = 0; i < s->map_cap; i++) {
+        if (s->map[i].occupied && s->map[i].key_level == 0) {
+            sum += s->map[i].count;
+        }
+    }
+    return sum;
+}
+
+static int map_has_duplicate_keys(const dshuf_stream_t *s) {
+    if (!s->map) return 0;
+    for (size_t i = 0; i < s->map_cap; i++) {
+        if (!s->map[i].occupied) continue;
+        for (size_t j = i + 1; j < s->map_cap; j++) {
+            if (s->map[j].occupied &&
+                s->map[j].key == s->map[i].key &&
+                s->map[j].key_level == s->map[i].key_level) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static void test_map_invariants_after_eviction(void) {
+    dshuf_stream_t stream;
+    assert(dshuf_stream_init(&stream, 16, 1, NULL, 0.05f, 7) == 0);
+
+    for (size_t i = 0; i < 2000; i++) {
+        uint32_t k = (uint32_t)(i + 1);
+        if (dshuf_stream_push(&stream, &k, (void *)(uintptr_t)(i + 1)) == 0) {
+            void *item = NULL;
+            assert(dshuf_stream_pop(&stream, &item) == 1);
+            assert(dshuf_stream_push(&stream, &k, (void *)(uintptr_t)(i + 1)) == 1);
+        }
+        assert(map_live_count(&stream) == stream.window_len);
+        assert(!map_has_duplicate_keys(&stream));
+    }
+
+    /* After unique flood, a tight cluster must still be tracked as one key. */
+    dshuf_stream_clear(&stream, NULL);
+    uint32_t cluster = 42;
+    for (int i = 0; i < 8; i++) {
+        assert(dshuf_stream_push(&stream, &cluster, (void *)(uintptr_t)(100 + i)) == 1);
+    }
+    assert(map_live_count(&stream) == 8);
+    assert(!map_has_duplicate_keys(&stream));
+
+    dshuf_stream_free(&stream);
+    printf("  [PASS] Map counts stay consistent after eviction\n");
+}
+
+static void test_hash_collision_is_stable(void) {
+    /* Same bytes must alias; distinct short strings almost never collide. */
+    assert(dshuf_hash_str("Radiohead") == dshuf_hash_str("Radiohead"));
+    assert(dshuf_hash_bytes("aa", 2) == dshuf_hash_bytes("aa", 2));
+    assert(dshuf_hash_str("Radiohead") != dshuf_hash_str("Beatles"));
+    printf("  [PASS] Hash stability and trivial non-collision\n");
+}
+
 static void test_bounded64_small_ranges(void) {
     dshuf_rng_t rng;
     dshuf_rng_seed(&rng, 99);
@@ -267,6 +329,8 @@ int main(void) {
     test_bounded_window_and_clear();
     test_jitter_1_pure_random();
     test_map_eviction_unique_keys();
+    test_map_invariants_after_eviction();
+    test_hash_collision_is_stable();
     test_bounded64_small_ranges();
     test_performance_benchmark();
     printf("All unit tests passed successfully!\n");

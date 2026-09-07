@@ -239,17 +239,10 @@ static dshuf_slot_t *dshuf_map_find(dshuf_stream_t *s, size_t key_level, uint32_
 
     if (!create) return NULL;
 
+    /* Only reuse holes on this key's probe sequence. Stealing an arbitrary
+     * stale slot elsewhere would hide the key from later lookups. */
     size_t use = first_empty;
     if (use == (size_t)-1) use = first_stale;
-    if (use == (size_t)-1) {
-        /* Probe chain had no hole; reclaim any stale slot in the table. */
-        for (size_t i = 0; i < s->map_cap; i++) {
-            if (dshuf_slot_stale(s, &s->map[i]) && s->map[i].occupied) {
-                use = i;
-                break;
-            }
-        }
-    }
     if (use == (size_t)-1) return NULL;
 
     dshuf_slot_t *slot = &s->map[use];
