@@ -37,13 +37,16 @@ public:
                     const std::vector<float> &weights = {},
                     float jitter = DSHUF_DEFAULT_JITTER,
                     uint64_t seed = 0)
-        : m_num_keys(num_keys)
+        : m_num_keys(num_keys), m_ok(false)
     {
         const float *w_ptr = weights.empty() ? nullptr : weights.data();
-        if (dshuf_stream_init(&m_stream, window_cap, num_keys, w_ptr, jitter, seed) != 0) {
+        m_ok = (dshuf_stream_init(&m_stream, window_cap, num_keys, w_ptr, jitter, seed) == 0);
+        if (!m_ok) {
             m_stream.window = nullptr;
         }
     }
+
+    bool valid() const { return m_ok && m_stream.window != nullptr; }
 
     ~Stream() {
         clear();
@@ -53,8 +56,9 @@ public:
     Stream(const Stream &) = delete;
     Stream &operator=(const Stream &) = delete;
 
-    Stream(Stream &&other) noexcept : m_num_keys(other.m_num_keys) {
+    Stream(Stream &&other) noexcept : m_num_keys(other.m_num_keys), m_ok(other.m_ok) {
         m_stream = other.m_stream;
+        other.m_ok = false;
         other.m_stream.window = nullptr;
         other.m_stream.map = nullptr;
         other.m_stream.window_len = 0;
@@ -65,7 +69,9 @@ public:
             clear();
             dshuf_stream_free(&m_stream);
             m_num_keys = other.m_num_keys;
+            m_ok = other.m_ok;
             m_stream = other.m_stream;
+            other.m_ok = false;
             other.m_stream.window = nullptr;
             other.m_stream.map = nullptr;
             other.m_stream.window_len = 0;
@@ -74,7 +80,7 @@ public:
     }
 
     bool push(T item, const std::vector<uint32_t> &keys) {
-        if (!m_stream.window) return false;
+        if (!valid()) return false;
         std::unique_ptr<T> copy(new T(std::move(item)));
         if (dshuf_stream_push(&m_stream, keys.data(), copy.get()) == 1) {
             copy.release();
@@ -117,6 +123,7 @@ public:
 
 private:
     size_t m_num_keys;
+    bool m_ok;
     dshuf_stream_t m_stream;
 };
 

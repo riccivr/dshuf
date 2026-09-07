@@ -73,6 +73,15 @@ portable_getdelim(char **lineptr, size_t *n, int delim, FILE *stream)
 	return (ssize_t)pos;
 }
 
+static void
+emit_record(const char *rec, size_t len, int delim)
+{
+	if (len > 0) {
+		fwrite(rec, 1, len, stdout);
+	}
+	fputc(delim, stdout);
+}
+
 char *argv0;
 
 static size_t opt_key_fields[DSHUF_MAX_KEYS];
@@ -244,8 +253,7 @@ process_streaming(FILE **files, int num_files)
 			while (dshuf_stream_count(&stream) >= opt_window) {
 				void *p = NULL;
 				if (dshuf_stream_pop(&stream, &p) && p) {
-					fputs((char *)p, stdout);
-					fputc(term_delim, stdout);
+					emit_record((char *)p, strlen((char *)p), term_delim);
 					free(p);
 					emitted++;
 					if (opt_limit >= 0 && emitted >= opt_limit) {
@@ -268,8 +276,7 @@ process_streaming(FILE **files, int num_files)
 	void *p = NULL;
 	while (dshuf_stream_pop(&stream, &p)) {
 		if (p) {
-			fputs((char *)p, stdout);
-			fputc(term_delim, stdout);
+			emit_record((char *)p, strlen((char *)p), term_delim);
 			free(p);
 			emitted++;
 			if (opt_limit >= 0 && emitted >= opt_limit) {
@@ -356,8 +363,7 @@ process_batch(FILE **files, int num_files)
 
 	for (size_t i = 0; i < emit_count; i++) {
 		size_t idx = indices[i];
-		fputs(lines[idx], stdout);
-		fputc(term_delim, stdout);
+		emit_record(lines[idx], strlen(lines[idx]), term_delim);
 	}
 
 	for (size_t i = 0; i < count; i++) {

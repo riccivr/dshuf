@@ -56,6 +56,10 @@ sizes (thousands to tens of thousands of tracks), collision probability is negli
 For datasets with over 65,000 distinct attribute values, hash collisions may treat
 distinct attributes as the same cluster.
 
+The streaming key map is sized \(O(WK)\) and reclaims slots whose in-window
+count is zero and whose last emission is older than the history horizon. Long
+streams of unique keys therefore stay within the advertised memory bound.
+
 CLI Usage
 ---------
 ```sh

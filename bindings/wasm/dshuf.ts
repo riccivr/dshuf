@@ -54,6 +54,23 @@ export class Prng {
   nextFloat(): number {
     return this.nextUint32() / 4294967296.0;
   }
+
+  bounded(range: number): number {
+    if (range <= 1) return 0;
+    const r = range >>> 0;
+    let x = this.nextUint32();
+    let m = BigInt(x) * BigInt(r);
+    let l = Number(m & 0xffffffffn) >>> 0;
+    if (l < r) {
+      const t = ((-r) >>> 0) % r;
+      while (l < t) {
+        x = this.nextUint32();
+        m = BigInt(x) * BigInt(r);
+        l = Number(m & 0xffffffffn) >>> 0;
+      }
+    }
+    return Number(m >> 32n);
+  }
 }
 
 interface WindowItem<T> {
@@ -88,7 +105,9 @@ export class Stream<T> {
     this.historyCap = this.windowCap;
   }
 
-  push(item: T, keys?: (string | number)[]): void {
+  /** Returns false when the window is at capacity (strictly bounded). */
+  push(item: T, keys?: (string | number)[]): boolean {
+    if (this.window.length >= this.windowCap) return false;
     const numericKeys: number[] = [];
     if (keys) {
       for (const k of keys) {
@@ -101,6 +120,7 @@ export class Stream<T> {
       keys: numericKeys,
       age: 0,
     });
+    return true;
   }
 
   pop(): T | undefined {
@@ -112,8 +132,16 @@ export class Stream<T> {
       return it.item;
     }
 
+    if (this.jitter >= 1.0) {
+      const pick = this.rng.bounded(this.window.length);
+      const chosen = this.window.splice(pick, 1)[0];
+      this.recordHistory(chosen.keys);
+      return chosen.item;
+    }
+
     let bestIdx = 0;
     let bestScore = Infinity;
+    const noiseBase = this.rng.nextUint32();
 
     for (let i = 0; i < this.window.length; i++) {
       const it = this.window[i];
@@ -140,7 +168,8 @@ export class Stream<T> {
       }
 
       const ageBonus = this.beta * (it.age / this.windowCap);
-      const noise = this.rng.nextFloat();
+      const mixed = (noiseBase ^ Math.imul(i + 1, 0x9e3779b9)) >>> 0;
+      const noise = mixed / 4294967296.0;
       const score = penalty - ageBonus + this.jitter * noise;
 
       if (score < bestScore) {

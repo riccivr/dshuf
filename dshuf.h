@@ -55,6 +55,21 @@ static inline uint32_t dshuf_rng_bounded(dshuf_rng_t *rng, uint32_t range) {
     return (uint32_t)(m >> 32);
 }
 
+/* Unbiased integer in [0, range) for 64-bit ranges (Fisher-Yates on huge n). */
+static inline uint64_t dshuf_rng_bounded64(dshuf_rng_t *rng, uint64_t range) {
+    if (range <= 1) return 0;
+    if (range <= 0xffffffffULL) {
+        return dshuf_rng_bounded(rng, (uint32_t)range);
+    }
+    /* Rejection sampling keeps this C99 / -pedantic clean (no __int128). */
+    uint64_t x;
+    uint64_t limit = UINT64_MAX - (UINT64_MAX % range);
+    do {
+        x = dshuf_rng_next(rng);
+    } while (x >= limit);
+    return x % range;
+}
+
 static inline float dshuf_rng_float(dshuf_rng_t *rng) {
     return (float)((dshuf_rng_next(rng) >> 40) * (1.0 / 16777216.0));
 }
@@ -187,6 +202,16 @@ uint32_t dshuf_hash(const void *data, size_t len) {
     return dshuf_hash_bytes(data, len);
 }
 
+/* A slot can be reused if it holds no live window items and its last emit
+ * is older than the history horizon. Occupied-but-stale reuse keeps probe
+ * chains intact (slot stays occupied) so we do not need tombstones. */
+static int dshuf_slot_stale(const dshuf_stream_t *s, const dshuf_slot_t *slot) {
+    if (!slot->occupied) return 1;
+    if (slot->count > 0) return 0;
+    if (slot->last_step == 0) return 1;
+    return (s->step_count - slot->last_step) > s->history_cap;
+}
+
 /* Internal hash slot lookup */
 static dshuf_slot_t *dshuf_map_find(dshuf_stream_t *s, size_t key_level, uint32_t key_val, int create) {
     if (!s->map || s->map_cap == 0) return NULL;
@@ -195,6 +220,7 @@ static dshuf_slot_t *dshuf_map_find(dshuf_stream_t *s, size_t key_level, uint32_
     uint32_t mix = key_val ^ (uint32_t)(key_level * 0x9e3779b9u);
     size_t idx = (size_t)(mix ^ (mix >> 16)) & s->map_mask;
     size_t first_empty = (size_t)-1;
+    size_t first_stale = (size_t)-1;
 
     for (size_t probe = 0; probe < s->map_cap; probe++) {
         dshuf_slot_t *slot = &s->map[idx];
@@ -205,20 +231,34 @@ static dshuf_slot_t *dshuf_map_find(dshuf_stream_t *s, size_t key_level, uint32_
         if (slot->key == key_val && slot->key_level == (uint32_t)key_level) {
             return slot;
         }
+        if (create && first_stale == (size_t)-1 && dshuf_slot_stale(s, slot)) {
+            first_stale = idx;
+        }
         idx = (idx + 1) & s->map_mask;
     }
 
-    if (create && first_empty != (size_t)-1) {
-        dshuf_slot_t *slot = &s->map[first_empty];
-        slot->occupied = 1;
-        slot->key = key_val;
-        slot->key_level = (uint32_t)key_level;
-        slot->count = 0;
-        slot->last_step = 0;
-        return slot;
-    }
+    if (!create) return NULL;
 
-    return NULL;
+    size_t use = first_empty;
+    if (use == (size_t)-1) use = first_stale;
+    if (use == (size_t)-1) {
+        /* Probe chain had no hole; reclaim any stale slot in the table. */
+        for (size_t i = 0; i < s->map_cap; i++) {
+            if (dshuf_slot_stale(s, &s->map[i]) && s->map[i].occupied) {
+                use = i;
+                break;
+            }
+        }
+    }
+    if (use == (size_t)-1) return NULL;
+
+    dshuf_slot_t *slot = &s->map[use];
+    slot->occupied = 1;
+    slot->key = key_val;
+    slot->key_level = (uint32_t)key_level;
+    slot->count = 0;
+    slot->last_step = 0;
+    return slot;
 }
 
 int dshuf_stream_init(dshuf_stream_t *s,
@@ -335,7 +375,7 @@ int dshuf_stream_pop(dshuf_stream_t *s, void **out_user_data)
 
     /* If no keys specified or jitter >= 1.0, direct unbiased uniform random pick */
     if (s->num_keys == 0 || s->jitter >= 1.0f) {
-        uint32_t pick = dshuf_rng_bounded(&s->rng, (uint32_t)s->window_len);
+        size_t pick = (size_t)dshuf_rng_bounded64(&s->rng, (uint64_t)s->window_len);
         if (out_user_data) *out_user_data = s->window[pick].user_data;
 
         if (s->num_keys > 0) {
@@ -359,6 +399,9 @@ int dshuf_stream_pop(dshuf_stream_t *s, void **out_user_data)
      */
     size_t best_idx = 0;
     float best_score = 1e30f;
+    /* One SplitMix draw per pop; per-candidate noise is a cheap mix.
+     * Ranking stays jittered without W extra PRNG rounds. */
+    uint64_t noise_base = dshuf_rng_next(&s->rng);
 
     for (size_t i = 0; i < s->window_len; i++) {
         dshuf_item_t *it = &s->window[i];
@@ -386,8 +429,8 @@ int dshuf_stream_pop(dshuf_stream_t *s, void **out_user_data)
         /* Starvation resistance: older items get score reduction */
         float age_bonus = s->beta * ((float)it->age / (float)(s->window_cap > 0 ? s->window_cap : 1));
 
-        /* Noise perturbation controlled by jitter */
-        float noise = dshuf_rng_float(&s->rng);
+        uint64_t mixed = noise_base ^ ((uint64_t)i * 0x9e3779b97f4a7c15ULL);
+        float noise = (float)((mixed >> 40) * (1.0 / 16777216.0));
         float score = penalty - age_bonus + (s->jitter * noise);
 
         if (score < best_score) {
@@ -473,7 +516,7 @@ int dshuf_batch(size_t *indices,
 
     /* Step 1: Unbiased Fisher-Yates shuffle using Lemire's method */
     for (size_t i = n - 1; i > 0; i--) {
-        size_t j = (size_t)dshuf_rng_bounded(&rng, (uint32_t)(i + 1));
+        size_t j = (size_t)dshuf_rng_bounded64(&rng, (uint64_t)i + 1ULL);
         size_t tmp = indices[i];
         indices[i] = indices[j];
         indices[j] = tmp;

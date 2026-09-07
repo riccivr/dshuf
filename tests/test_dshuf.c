@@ -187,6 +187,51 @@ static void test_jitter_1_pure_random(void) {
     printf("  [PASS] Pure random shuffle at jitter 1.0\n");
 }
 
+static void test_map_eviction_unique_keys(void) {
+    /* Window 8, thousands of unique keys: map must not lock up or drop items. */
+    dshuf_stream_t stream;
+    assert(dshuf_stream_init(&stream, 8, 1, NULL, 0.1f, 1) == 0);
+
+    const size_t total = 4000;
+    size_t pushed = 0, popped = 0;
+    while (popped < total) {
+        if (pushed < total) {
+            uint32_t k = (uint32_t)(pushed + 1);
+            int pr = dshuf_stream_push(&stream, &k, (void *)(uintptr_t)(pushed + 1));
+            if (pr == 1) {
+                pushed++;
+            } else if (pr == 0) {
+                void *item = NULL;
+                assert(dshuf_stream_pop(&stream, &item) == 1);
+                popped++;
+            } else {
+                assert(0 && "push failed");
+            }
+        } else {
+            void *item = NULL;
+            assert(dshuf_stream_pop(&stream, &item) == 1);
+            popped++;
+        }
+    }
+    assert(pushed == total);
+    assert(popped == total);
+    assert(dshuf_stream_count(&stream) == 0);
+    dshuf_stream_free(&stream);
+    printf("  [PASS] Map eviction under unique-key flood (%zu items)\n", total);
+}
+
+static void test_bounded64_small_ranges(void) {
+    dshuf_rng_t rng;
+    dshuf_rng_seed(&rng, 99);
+    for (uint64_t r = 1; r <= 17; r++) {
+        for (int i = 0; i < 200; i++) {
+            uint64_t v = dshuf_rng_bounded64(&rng, r);
+            assert(v < r || r == 0);
+        }
+    }
+    printf("  [PASS] bounded64 stays in range\n");
+}
+
 static void test_performance_benchmark(void) {
     const size_t n = 50000;
     size_t *indices = (size_t *)malloc(n * sizeof(size_t));
@@ -221,6 +266,8 @@ int main(void) {
     test_starvation_resistance();
     test_bounded_window_and_clear();
     test_jitter_1_pure_random();
+    test_map_eviction_unique_keys();
+    test_bounded64_small_ranges();
     test_performance_benchmark();
     printf("All unit tests passed successfully!\n");
     return 0;
