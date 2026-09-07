@@ -60,15 +60,17 @@ test: dshuf
 	@echo running C unit tests
 	@$(CC) $(CFLAGS) tests/test_dshuf.c -o tests/test_dshuf $(LDFLAGS)
 	@./tests/test_dshuf
-	@echo running CLI pipeline tests
-	@sh tests/test_cli.sh
+	@echo running CLI integration tests
+	@sh tests/test_dshuf.sh
 
-sanitize: clean
-	@echo compiling with AddressSanitizer and UndefinedBehaviorSanitizer
-	@$(CC) $(CFLAGS) -g -fsanitize=address,undefined dshuf.c -o dshuf $(LDFLAGS) -fsanitize=address,undefined
-	@$(CC) $(CFLAGS) -g -fsanitize=address,undefined tests/test_dshuf.c -o tests/test_dshuf $(LDFLAGS) -fsanitize=address,undefined
-	@./tests/test_dshuf
-	@sh tests/test_cli.sh
+test-posix: dshuf
+	@sh tests/test_posix.sh
+
+test-stress: dshuf
+	@sh tests/test_stress.sh
+
+test-properties: dshuf
+	@sh tests/test_properties.sh
 
 test-cpp:
 	@echo running C++ binding tests
@@ -80,6 +82,39 @@ test-python: libdshuf.so
 	@echo running Python binding tests
 	@python3 tests/test_python.py
 
-test-all: test test-cpp test-python
+test-all: test test-posix test-stress test-properties test-cpp test-python
 
-.PHONY: all options clean dist install uninstall test sanitize test-cpp test-python test-all
+test-valgrind: clean
+	@echo building with debug symbols
+	@$(CC) $(CFLAGS) -g dshuf.c -o dshuf $(LDFLAGS)
+	@echo running valgrind leak check
+	@printf "artistA\ttrack1\nartistB\ttrack2\n" | valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all --error-exitcode=1 ./dshuf -k 1 >/dev/null
+	@printf "artistA\ttrack1\nartistB\ttrack2\n" | valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all --error-exitcode=1 ./dshuf -k 1 -S -w 16 -n 1 >/dev/null
+	@echo valgrind: 0 memory leaks, 0 errors
+
+test-tcc: clean
+	@echo compiling with tcc
+	@tcc -std=c99 -D_POSIX_C_SOURCE=200809L -DVERSION=\"$(VERSION)\" dshuf.c -o dshuf
+	@sh tests/test_dshuf.sh
+	@sh tests/test_posix.sh
+
+test-clang: clean
+	@echo compiling with clang
+	@clang -std=c99 -Wall -Wextra -pedantic -D_POSIX_C_SOURCE=200809L -DVERSION=\"$(VERSION)\" dshuf.c -o dshuf
+	@sh tests/test_dshuf.sh
+	@sh tests/test_posix.sh
+
+sanitize: clean
+	@echo compiling with AddressSanitizer and UndefinedBehaviorSanitizer
+	@$(CC) $(CFLAGS) -g -fsanitize=address,undefined dshuf.c -o dshuf $(LDFLAGS) -fsanitize=address,undefined
+	@$(CC) $(CFLAGS) -g -fsanitize=address,undefined tests/test_dshuf.c -o tests/test_dshuf $(LDFLAGS) -fsanitize=address,undefined
+	@./tests/test_dshuf
+	@sh tests/test_dshuf.sh
+	@sh tests/test_posix.sh
+	@sh tests/test_stress.sh
+	@sh tests/test_properties.sh
+
+bench: dshuf
+	@sh tests/benchmark.sh
+
+.PHONY: all options clean dist install uninstall test test-posix test-stress test-properties test-all test-valgrind test-tcc test-clang test-cpp test-python sanitize bench
