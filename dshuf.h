@@ -1,5 +1,5 @@
 /*
- * dshuf - Suckless multi-key low-discrepancy shuffler
+ * dshuf - Suckless multi-key balanced shuffler
  * See LICENSE file for copyright and license details.
  *
  * Single-header library. In exactly one C/C++ source file, define:
@@ -38,6 +38,23 @@ static inline uint64_t dshuf_rng_next(dshuf_rng_t *rng) {
     return z ^ (z >> 31);
 }
 
+/* Daniel Lemire's nearly divisionless unbiased bounded random integer in [0, range) */
+static inline uint32_t dshuf_rng_bounded(dshuf_rng_t *rng, uint32_t range) {
+    if (range <= 1) return 0;
+    uint64_t x = (uint32_t)dshuf_rng_next(rng);
+    uint64_t m = x * (uint64_t)range;
+    uint32_t l = (uint32_t)m;
+    if (l < range) {
+        uint32_t t = (uint32_t)(-(int32_t)range) % range;
+        while (l < t) {
+            x = (uint32_t)dshuf_rng_next(rng);
+            m = x * (uint64_t)range;
+            l = (uint32_t)m;
+        }
+    }
+    return (uint32_t)(m >> 32);
+}
+
 static inline float dshuf_rng_float(dshuf_rng_t *rng) {
     return (float)((dshuf_rng_next(rng) >> 40) * (1.0 / 16777216.0));
 }
@@ -63,12 +80,24 @@ static inline uint32_t dshuf_hash_str(const char *s) {
     return h;
 }
 
+/* Public hash function declaration */
+uint32_t dshuf_hash(const void *data, size_t len);
+
 /* Item tracked inside streaming window */
 typedef struct {
     uint32_t keys[DSHUF_MAX_KEYS];
     void *user_data;
     uint32_t age;
 } dshuf_item_t;
+
+/* Open-addressing slot to track key frequency and last emission step in O(1) */
+typedef struct {
+    uint32_t key;
+    uint32_t key_level;
+    uint32_t count;
+    size_t last_step;
+    uint8_t occupied;
+} dshuf_slot_t;
 
 /* Streaming shuffler context */
 typedef struct {
@@ -82,11 +111,14 @@ typedef struct {
 
     dshuf_item_t *window;
 
-    /* Emitted history ring buffer */
+    /* O(1) frequency & distance lookup table */
+    size_t map_cap;
+    size_t map_mask;
+    dshuf_slot_t *map;
+
+    /* Global emission step counter for O(1) history distance */
+    size_t step_count;
     size_t history_cap;
-    size_t history_len;
-    size_t history_head;
-    uint32_t *history_keys; /* [history_cap * num_keys] */
 } dshuf_stream_t;
 
 /* Initialize a streaming shuffler */
@@ -97,7 +129,12 @@ int dshuf_stream_init(dshuf_stream_t *s,
                       float jitter,
                       uint64_t seed);
 
-/* Push an item into the streaming window. Returns 0 on success, -1 on allocation failure. */
+/*
+ * Push an item into the streaming window.
+ * Returns 1 on success.
+ * Returns 0 if window is full (strictly bounded O(W) memory).
+ * Returns -1 on invalid argument.
+ */
 int dshuf_stream_push(dshuf_stream_t *s, const uint32_t *keys, void *user_data);
 
 /*
@@ -110,18 +147,19 @@ int dshuf_stream_pop(dshuf_stream_t *s, void **out_user_data);
 /* Number of items currently queued in the window */
 size_t dshuf_stream_count(const dshuf_stream_t *s);
 
+/*
+ * Drain and clear all remaining items in window, optionally calling free_fn on each user_data.
+ */
+void dshuf_stream_clear(dshuf_stream_t *s, void (*free_fn)(void *));
+
 /* Free internal buffers of streaming shuffler */
 void dshuf_stream_free(dshuf_stream_t *s);
 
 /*
  * Batch shuffle:
  * Reorders `indices` array of size `n` in place.
- * If `keys` is NULL or `num_keys` == 0, performs standard Fisher-Yates shuffle.
- * Otherwise, performs multi-key low-discrepancy shuffle with starvation protection.
- *
- * keys: flat array of [n * num_keys] hashes, or NULL
- * weights: array of [num_keys] floats, or NULL (defaults to 1.0, 0.5, 0.25...)
- * window_size: internal window size for distance evaluation (0 for auto: min(n, 256))
+ * If `keys` is NULL or `num_keys` == 0, performs unbiased Fisher-Yates shuffle.
+ * Otherwise, performs multi-key balanced shuffle with starvation resistance.
  */
 int dshuf_batch(size_t *indices,
                 const uint32_t *keys,
@@ -140,8 +178,48 @@ int dshuf_batch(size_t *indices,
 
 #ifdef DSHUF_IMPLEMENTATION
 
+#ifndef DSHUF_NO_STDLIB
 #include <stdlib.h>
 #include <string.h>
+#endif
+
+uint32_t dshuf_hash(const void *data, size_t len) {
+    return dshuf_hash_bytes(data, len);
+}
+
+/* Internal hash slot lookup */
+static dshuf_slot_t *dshuf_map_find(dshuf_stream_t *s, size_t key_level, uint32_t key_val, int create) {
+    if (!s->map || s->map_cap == 0) return NULL;
+
+    /* Combine key level and key value for slot hashing */
+    uint32_t mix = key_val ^ (uint32_t)(key_level * 0x9e3779b9u);
+    size_t idx = (size_t)(mix ^ (mix >> 16)) & s->map_mask;
+    size_t first_empty = (size_t)-1;
+
+    for (size_t probe = 0; probe < s->map_cap; probe++) {
+        dshuf_slot_t *slot = &s->map[idx];
+        if (!slot->occupied) {
+            if (first_empty == (size_t)-1) first_empty = idx;
+            break;
+        }
+        if (slot->key == key_val && slot->key_level == (uint32_t)key_level) {
+            return slot;
+        }
+        idx = (idx + 1) & s->map_mask;
+    }
+
+    if (create && first_empty != (size_t)-1) {
+        dshuf_slot_t *slot = &s->map[first_empty];
+        slot->occupied = 1;
+        slot->key = key_val;
+        slot->key_level = (uint32_t)key_level;
+        slot->count = 0;
+        slot->last_step = 0;
+        return slot;
+    }
+
+    return NULL;
+}
 
 int dshuf_stream_init(dshuf_stream_t *s,
                       size_t window_cap,
@@ -160,6 +238,8 @@ int dshuf_stream_init(dshuf_stream_t *s,
     s->num_keys = num_keys;
     s->jitter = (jitter < 0.0f) ? 0.0f : ((jitter > 1.0f) ? 1.0f : jitter);
     s->beta = DSHUF_DEFAULT_BETA;
+    s->step_count = 1;
+    s->history_cap = window_cap;
     dshuf_rng_seed(&s->rng, seed);
 
     for (size_t k = 0; k < num_keys; k++) {
@@ -176,19 +256,25 @@ int dshuf_stream_init(dshuf_stream_t *s,
     s->window = (dshuf_item_t *)malloc(s->window_cap * sizeof(dshuf_item_t));
     if (!s->window) return -1;
 
-    /* History depth matches window capacity */
-    s->history_cap = s->window_cap;
-    s->history_len = 0;
-    s->history_head = 0;
     if (s->num_keys > 0) {
-        s->history_keys = (uint32_t *)malloc(s->history_cap * s->num_keys * sizeof(uint32_t));
-        if (!s->history_keys) {
+        /* Allocate map with power-of-two size at least 4 * window_cap for <= 25% load factor */
+        size_t cap = 16;
+        while (cap < s->window_cap * s->num_keys * 4) {
+            cap <<= 1;
+        }
+        s->map_cap = cap;
+        s->map_mask = cap - 1;
+        s->map = (dshuf_slot_t *)malloc(s->map_cap * sizeof(dshuf_slot_t));
+        if (!s->map) {
             free(s->window);
             s->window = NULL;
             return -1;
         }
+        memset(s->map, 0, s->map_cap * sizeof(dshuf_slot_t));
     } else {
-        s->history_keys = NULL;
+        s->map = NULL;
+        s->map_cap = 0;
+        s->map_mask = 0;
     }
 
     return 0;
@@ -198,60 +284,32 @@ int dshuf_stream_push(dshuf_stream_t *s, const uint32_t *keys, void *user_data)
 {
     if (!s || !s->window) return -1;
 
+    /* Strictly bounded window: refuse push when full */
     if (s->window_len >= s->window_cap) {
-        /* Expand window capacity if full */
-        size_t new_cap = s->window_cap * 2;
-        dshuf_item_t *new_win = (dshuf_item_t *)realloc(s->window, new_cap * sizeof(dshuf_item_t));
-        if (!new_win) return -1;
-        s->window = new_win;
-        s->window_cap = new_cap;
+        return 0;
     }
 
     dshuf_item_t *item = &s->window[s->window_len++];
     item->user_data = user_data;
     item->age = 0;
+
     if (keys && s->num_keys > 0) {
         memcpy(item->keys, keys, s->num_keys * sizeof(uint32_t));
+        /* Increment key counts in map */
+        for (size_t k = 0; k < s->num_keys; k++) {
+            dshuf_slot_t *slot = dshuf_map_find(s, k, keys[k], 1);
+            if (slot) slot->count++;
+        }
     } else {
         memset(item->keys, 0, sizeof(item->keys));
     }
 
-    return 0;
+    return 1;
 }
 
 size_t dshuf_stream_count(const dshuf_stream_t *s)
 {
     return s ? s->window_len : 0;
-}
-
-static void dshuf_record_history(dshuf_stream_t *s, const uint32_t *keys)
-{
-    if (!s->history_keys || s->num_keys == 0 || s->history_cap == 0) return;
-
-    size_t idx = s->history_head;
-    memcpy(&s->history_keys[idx * s->num_keys], keys, s->num_keys * sizeof(uint32_t));
-    s->history_head = (idx + 1) % s->history_cap;
-    if (s->history_len < s->history_cap) {
-        s->history_len++;
-    }
-}
-
-/*
- * Find distance (1-based) to most recent occurrence of key at level k in history.
- * Returns 0 if not found in history.
- */
-static size_t dshuf_find_history_dist(const dshuf_stream_t *s, size_t key_level, uint32_t key_val)
-{
-    if (s->history_len == 0 || !s->history_keys) return 0;
-
-    size_t head = s->history_head;
-    for (size_t d = 1; d <= s->history_len; d++) {
-        size_t slot = (head >= d) ? (head - d) : (s->history_cap + head - d);
-        if (s->history_keys[slot * s->num_keys + key_level] == key_val) {
-            return d;
-        }
-    }
-    return 0;
 }
 
 int dshuf_stream_pop(dshuf_stream_t *s, void **out_user_data)
@@ -261,23 +319,43 @@ int dshuf_stream_pop(dshuf_stream_t *s, void **out_user_data)
     /* If only 1 item in window, emit directly */
     if (s->window_len == 1) {
         if (out_user_data) *out_user_data = s->window[0].user_data;
-        dshuf_record_history(s, s->window[0].keys);
+        if (s->num_keys > 0) {
+            for (size_t k = 0; k < s->num_keys; k++) {
+                dshuf_slot_t *slot = dshuf_map_find(s, k, s->window[0].keys[k], 0);
+                if (slot) {
+                    if (slot->count > 0) slot->count--;
+                    slot->last_step = s->step_count;
+                }
+            }
+        }
+        s->step_count++;
         s->window_len = 0;
         return 1;
     }
 
-    /* If no keys specified, simple uniform random pick */
-    if (s->num_keys == 0) {
-        size_t pick = (size_t)(dshuf_rng_next(&s->rng) % s->window_len);
+    /* If no keys specified or jitter >= 1.0, direct unbiased uniform random pick */
+    if (s->num_keys == 0 || s->jitter >= 1.0f) {
+        uint32_t pick = dshuf_rng_bounded(&s->rng, (uint32_t)s->window_len);
         if (out_user_data) *out_user_data = s->window[pick].user_data;
+
+        if (s->num_keys > 0) {
+            for (size_t k = 0; k < s->num_keys; k++) {
+                dshuf_slot_t *slot = dshuf_map_find(s, k, s->window[pick].keys[k], 0);
+                if (slot) {
+                    if (slot->count > 0) slot->count--;
+                    slot->last_step = s->step_count;
+                }
+            }
+        }
+        s->step_count++;
         s->window[pick] = s->window[s->window_len - 1];
         s->window_len--;
         return 1;
     }
 
     /*
-     * Compute key counts in current window to determine ideal spacing S_k.
-     * S_k = window_len / count_in_window.
+     * Evaluate each candidate in O(1) per key using map lookups.
+     * Total pop complexity is O(W * num_keys).
      */
     size_t best_idx = 0;
     float best_score = 1e30f;
@@ -288,26 +366,24 @@ int dshuf_stream_pop(dshuf_stream_t *s, void **out_user_data)
 
         for (size_t k = 0; k < s->num_keys; k++) {
             uint32_t kval = it->keys[k];
+            dshuf_slot_t *slot = dshuf_map_find(s, k, kval, 0);
 
-            /* Count occurrences of this key inside current window */
-            size_t count_k = 0;
-            for (size_t j = 0; j < s->window_len; j++) {
-                if (s->window[j].keys[k] == kval) count_k++;
-            }
-
+            size_t count_k = slot ? slot->count : 1;
             float ideal_spacing = (float)s->window_len / (float)(count_k > 0 ? count_k : 1);
             if (ideal_spacing < 1.0f) ideal_spacing = 1.0f;
 
-            size_t dist = dshuf_find_history_dist(s, k, kval);
             float dev = 0.0f;
-            if (dist > 0) {
-                dev = (ideal_spacing - (float)dist) / ideal_spacing;
-                if (dev < -1.0f) dev = -1.0f;
+            if (slot && slot->last_step > 0) {
+                size_t dist = s->step_count - slot->last_step;
+                if (dist <= s->history_cap) {
+                    dev = (ideal_spacing - (float)dist) / ideal_spacing;
+                    if (dev < -1.0f) dev = -1.0f;
+                }
             }
             penalty += s->weights[k] * dev;
         }
 
-        /* Starvation bonus: older items get score reduction */
+        /* Starvation resistance: older items get score reduction */
         float age_bonus = s->beta * ((float)it->age / (float)(s->window_cap > 0 ? s->window_cap : 1));
 
         /* Noise perturbation controlled by jitter */
@@ -327,9 +403,17 @@ int dshuf_stream_pop(dshuf_stream_t *s, void **out_user_data)
         }
     }
 
-    /* Record chosen item to history */
+    /* Record chosen item and update map */
     if (out_user_data) *out_user_data = s->window[best_idx].user_data;
-    dshuf_record_history(s, s->window[best_idx].keys);
+
+    for (size_t k = 0; k < s->num_keys; k++) {
+        dshuf_slot_t *slot = dshuf_map_find(s, k, s->window[best_idx].keys[k], 0);
+        if (slot) {
+            if (slot->count > 0) slot->count--;
+            slot->last_step = s->step_count;
+        }
+    }
+    s->step_count++;
 
     /* Swap with last element and shrink */
     s->window[best_idx] = s->window[s->window_len - 1];
@@ -338,15 +422,34 @@ int dshuf_stream_pop(dshuf_stream_t *s, void **out_user_data)
     return 1;
 }
 
+void dshuf_stream_clear(dshuf_stream_t *s, void (*free_fn)(void *))
+{
+    if (!s) return;
+    if (free_fn) {
+        for (size_t i = 0; i < s->window_len; i++) {
+            if (s->window[i].user_data) {
+                free_fn(s->window[i].user_data);
+                s->window[i].user_data = NULL;
+            }
+        }
+    }
+    s->window_len = 0;
+    if (s->map) {
+        memset(s->map, 0, s->map_cap * sizeof(dshuf_slot_t));
+    }
+}
+
 void dshuf_stream_free(dshuf_stream_t *s)
 {
     if (!s) return;
     free(s->window);
-    free(s->history_keys);
+    free(s->map);
     s->window = NULL;
-    s->history_keys = NULL;
+    s->map = NULL;
     s->window_len = 0;
     s->window_cap = 0;
+    s->map_cap = 0;
+    s->map_mask = 0;
 }
 
 int dshuf_batch(size_t *indices,
@@ -368,20 +471,20 @@ int dshuf_batch(size_t *indices,
         indices[i] = i;
     }
 
-    /* Step 1: Initial Fisher-Yates shuffle */
+    /* Step 1: Unbiased Fisher-Yates shuffle using Lemire's method */
     for (size_t i = n - 1; i > 0; i--) {
-        size_t j = (size_t)(dshuf_rng_next(&rng) % (i + 1));
+        size_t j = (size_t)dshuf_rng_bounded(&rng, (uint32_t)(i + 1));
         size_t tmp = indices[i];
         indices[i] = indices[j];
         indices[j] = tmp;
     }
 
-    /* If no keys or single item, Fisher-Yates is sufficient */
-    if (!keys || num_keys == 0 || n <= 2) {
+    /* If no keys, single item, or jitter >= 1.0, unbiased Fisher-Yates is sufficient */
+    if (!keys || num_keys == 0 || n <= 2 || jitter >= 1.0f) {
         return 0;
     }
 
-    /* Step 2: Feed through low-discrepancy window buffer */
+    /* Step 2: Feed through balanced window buffer */
     if (window_size == 0) {
         window_size = (n < DSHUF_DEFAULT_WINDOW) ? n : DSHUF_DEFAULT_WINDOW;
     }
@@ -426,7 +529,5 @@ int dshuf_batch(size_t *indices,
 
     return 0;
 }
-
-uint32_t dshuf_hash(const void *data, size_t len) { return dshuf_hash_bytes(data, len); }
 
 #endif /* DSHUF_IMPLEMENTATION */

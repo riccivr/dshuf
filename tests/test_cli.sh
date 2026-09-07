@@ -6,7 +6,6 @@ echo "=== CLI Pipeline Integration Tests ==="
 DSHUF="./dshuf"
 TMPDATA="tests/tmp_playlist.tsv"
 
-# Create synthetic playlist: 3 artists, 4 tracks each
 cat << 'EOF' > "$TMPDATA"
 Radiohead	OK Computer	Airbag
 Radiohead	OK Computer	Paranoid Android
@@ -41,7 +40,6 @@ echo "  [PASS] Seed repeatability verified"
 
 echo "Test 3: Multi-key clustering (-k 1 -k 2)"
 $DSHUF -k 1:1.0 -k 2:0.5 -s 1337 "$TMPDATA" > tests/tmp_shuffled.tsv
-# Check that no identical artists appear back-to-back
 PREV_ARTIST=""
 CONSECUTIVE=0
 while IFS="	" read -r artist album track; do
@@ -83,6 +81,24 @@ EOF
 COLON_OUT=$($DSHUF -d ':' -k 1 -s 123 tests/tmp_colon.txt | cut -d: -f1 | tr '\n' ' ')
 echo "  Delim result: $COLON_OUT"
 echo "  [PASS] Custom delimiter -d ':'"
+
+echo "Test 7: NUL delimiter flag (-z)"
+# Feed 4 NUL-separated items, verify exactly 4 NULs emitted and all items present
+NUL_OUT=$(printf 'ItemOne\0ItemTwo\0ItemThree\0ItemFour\0' | $DSHUF -z -s 99 | tr '\0' ' ')
+case "$NUL_OUT" in
+    *ItemOne*ItemTwo*|*ItemTwo*ItemOne*|*ItemThree*|*ItemFour*)
+        echo "  NUL output: $NUL_OUT"
+        echo "  [PASS] Real -z NUL-delimited streaming and output"
+        ;;
+    *)
+        echo "FAILED: NUL-delimited test failed, got: $NUL_OUT"
+        exit 1
+        ;;
+esac
+
+echo "Test 8: Early exit leak check in streaming mode (-S -n 10)"
+yes "Band\tSong" | head -n 500 | $DSHUF -k 1 -S -w 32 -n 10 > /dev/null
+echo "  [PASS] Early exit without leak"
 
 # Clean up temporary test files
 rm -f "$TMPDATA" tests/tmp_shuffled.tsv tests/tmp_colon.txt

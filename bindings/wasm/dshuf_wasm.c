@@ -7,23 +7,25 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Minimal bump allocator */
+/* Minimal bump allocator with tracked allocation size */
 extern unsigned char __heap_base;
 static unsigned char *bump_ptr = &__heap_base;
 
 void *malloc(size_t size) {
     size = (size + 7) & ~7;
-    void *p = bump_ptr;
-    bump_ptr += size;
-    return p;
+    size_t *header = (size_t *)bump_ptr;
+    *header = size;
+    bump_ptr += size + sizeof(size_t);
+    return (void *)(header + 1);
 }
 
-void *realloc(void *ptr, size_t size) {
-    void *new_p = malloc(size);
-    if (ptr) {
-        char *d = (char *)new_p;
-        const char *s = (const char *)ptr;
-        for (size_t i = 0; i < size; i++) d[i] = s[i];
+void *realloc(void *ptr, size_t new_size) {
+    if (!ptr) return malloc(new_size);
+    size_t old_size = *((size_t *)ptr - 1);
+    void *new_p = malloc(new_size);
+    size_t copy_size = (old_size < new_size) ? old_size : new_size;
+    for (size_t i = 0; i < copy_size; i++) {
+        ((char *)new_p)[i] = ((const char *)ptr)[i];
     }
     return new_p;
 }

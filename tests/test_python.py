@@ -21,13 +21,11 @@ def test_python_bindings():
     artists = [t["artist"] for t in shuffled]
     print(f"  Shuffled order: {' -> '.join(artists)}")
 
-    # Verify no back-to-back artists
     for i in range(len(artists) - 1):
         assert artists[i] != artists[i+1], f"Artists repeated back-to-back at {i}"
 
     print("  [PASS] Single-key Python shuffle with zero adjacent repeats")
 
-    # Multi-key test
     items = [
         ("Radiohead", "OK Computer", 1),
         ("Radiohead", "OK Computer", 2),
@@ -40,6 +38,24 @@ def test_python_bindings():
     mk_shuffled = dshuf.shuffle(items, keys=lambda x: (x[0], x[1]), jitter=0.05, seed=123)
     assert len(mk_shuffled) == len(items)
     print("  [PASS] Multi-key Python shuffle")
+
+    # Native Python Stream test
+    s = dshuf.Stream(window_cap=8, jitter=0.1, seed=99)
+    s.push("Radiohead_1", ["Radiohead"])
+    s.push("Beatles_1", ["Beatles"])
+    s.push("Radiohead_2", ["Radiohead"])
+    assert s.count() == 3
+
+    popped = s.pop()
+    assert popped is not None
+    print(f"  Stream popped: {popped}")
+    print("  [PASS] Python Stream push/pop")
+
+    # Generator stream() test
+    gen_items = [f"Band{i%3}_Track{i}" for i in range(20)]
+    streamed = list(dshuf.stream(gen_items, key=lambda x: x.split("_")[0], window_size=8, seed=42))
+    assert len(streamed) == len(gen_items)
+    print("  [PASS] Python stream() generator")
 
     print("All Python binding tests passed!")
 

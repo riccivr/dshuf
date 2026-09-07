@@ -1,4 +1,4 @@
-# dshuf - suckless multi-key low-discrepancy shuffler
+# dshuf - suckless multi-key balanced shuffler
 # See LICENSE file for copyright and license details.
 
 include config.mk
@@ -63,6 +63,13 @@ test: dshuf
 	@echo running CLI pipeline tests
 	@sh tests/test_cli.sh
 
+sanitize: clean
+	@echo compiling with AddressSanitizer and UndefinedBehaviorSanitizer
+	@$(CC) $(CFLAGS) -g -fsanitize=address,undefined dshuf.c -o dshuf $(LDFLAGS) -fsanitize=address,undefined
+	@$(CC) $(CFLAGS) -g -fsanitize=address,undefined tests/test_dshuf.c -o tests/test_dshuf $(LDFLAGS) -fsanitize=address,undefined
+	@./tests/test_dshuf
+	@sh tests/test_cli.sh
+
 test-cpp:
 	@echo running C++ binding tests
 	@$${CXX:-c++} -std=c++11 -Wall -Wextra -pedantic -O2 tests/test_cpp.cpp -o tests/test_cpp
@@ -75,4 +82,4 @@ test-python: libdshuf.so
 
 test-all: test test-cpp test-python
 
-.PHONY: all options clean dist install uninstall test test-cpp test-python test-all
+.PHONY: all options clean dist install uninstall test sanitize test-cpp test-python test-all

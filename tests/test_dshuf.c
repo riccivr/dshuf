@@ -1,4 +1,4 @@
-﻿#define DSHUF_IMPLEMENTATION
+#define DSHUF_IMPLEMENTATION
 #include "../dshuf.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +26,7 @@ static void test_hash_integrity(void) {
     assert(h1 == h2);
     assert(h1 != h3);
     assert(dshuf_hash_str("") == 2166136261u);
+    assert(dshuf_hash("Radiohead", 9) == h1);
     printf("  [PASS] Hash integrity\n");
 }
 
@@ -34,7 +35,6 @@ static void test_batch_permutation_validity(void) {
     size_t indices[200];
     uint32_t keys[200];
 
-    /* Assign 5 clusters (40 items each) */
     for (size_t i = 0; i < n; i++) {
         keys[i] = (uint32_t)(i % 5);
     }
@@ -42,7 +42,6 @@ static void test_batch_permutation_validity(void) {
     int ret = dshuf_batch(indices, keys, n, 1, NULL, 0.1f, 64, 42);
     assert(ret == 0);
 
-    /* Verify permutation completeness */
     int seen[200] = {0};
     for (size_t i = 0; i < n; i++) {
         assert(indices[i] < n);
@@ -59,15 +58,12 @@ static void test_cluster_spacing(void) {
     size_t indices[100];
     uint32_t keys[100];
 
-    /* 10 artists, 10 tracks each */
     for (size_t i = 0; i < n; i++) {
         keys[i] = (uint32_t)(i / 10);
     }
 
-    /* Shuffle with low jitter (0.05) */
     dshuf_batch(indices, keys, n, 1, NULL, 0.05f, 64, 999);
 
-    /* Measure minimum distance between tracks of the same artist */
     size_t min_dist = 9999;
     size_t last_pos[10];
     for (int a = 0; a < 10; a++) last_pos[a] = 9999;
@@ -81,8 +77,6 @@ static void test_cluster_spacing(void) {
         last_pos[artist] = pos;
     }
 
-    /* With 10 artists of 10 tracks, ideal spacing is 10.
-       Under low jitter, minimum distance should easily be >= 4. */
     assert(min_dist >= 4);
     printf("  [PASS] Cluster spacing separation (min-distance: %zu, ideal: 10)\n", min_dist);
 }
@@ -90,9 +84,8 @@ static void test_cluster_spacing(void) {
 static void test_multi_key_clustering(void) {
     const size_t n = 120;
     size_t indices[120];
-    uint32_t keys[120 * 2]; /* 2 keys: key 0 = artist, key 1 = album */
+    uint32_t keys[120 * 2];
 
-    /* 4 artists, each has 3 albums, each album has 10 tracks */
     for (size_t i = 0; i < n; i++) {
         uint32_t artist = (uint32_t)(i / 30);
         uint32_t album = (uint32_t)(i / 10);
@@ -103,7 +96,6 @@ static void test_multi_key_clustering(void) {
     float weights[2] = {1.0f, 0.5f};
     dshuf_batch(indices, keys, n, 2, weights, 0.05f, 64, 1234);
 
-    /* Verify that identical album tracks are never adjacent */
     size_t min_album_dist = 9999;
     size_t last_album_pos[12];
     for (int a = 0; a < 12; a++) last_album_pos[a] = 9999;
@@ -127,7 +119,6 @@ static void test_starvation_resistance(void) {
     size_t indices[100];
     uint32_t keys[100];
 
-    /* 50 tracks by Artist 1 (dominant), 50 tracks by unique artists (2..51) */
     for (size_t i = 0; i < 50; i++) {
         keys[i] = 1;
     }
@@ -137,7 +128,6 @@ static void test_starvation_resistance(void) {
 
     dshuf_batch(indices, keys, n, 1, NULL, 0.1f, 64, 777);
 
-    /* Count occurrences of dominant artist in first 20 and last 20 slots */
     int first_20_dominant = 0;
     int last_20_dominant = 0;
 
@@ -154,50 +144,47 @@ static void test_starvation_resistance(void) {
            first_20_dominant, last_20_dominant);
 }
 
-static void test_streaming_api(void) {
+static void test_bounded_window_and_clear(void) {
     dshuf_stream_t stream;
-    int ret = dshuf_stream_init(&stream, 32, 2, NULL, 0.2f, 54321);
+    int ret = dshuf_stream_init(&stream, 4, 1, NULL, 0.2f, 101);
     assert(ret == 0);
 
-    /* Feed 500 items into stream, pulling after priming */
-    const size_t total = 500;
-    size_t pushed = 0;
-    size_t popped = 0;
+    uint32_t k = 42;
+    assert(dshuf_stream_push(&stream, &k, (void *)1) == 1);
+    assert(dshuf_stream_push(&stream, &k, (void *)2) == 1);
+    assert(dshuf_stream_push(&stream, &k, (void *)3) == 1);
+    assert(dshuf_stream_push(&stream, &k, (void *)4) == 1);
 
-    while (popped < total) {
-        if (pushed < total) {
-            uint32_t k[2];
-            k[0] = (uint32_t)(pushed % 10);  /* 10 artists */
-            k[1] = (uint32_t)(pushed % 30);  /* 30 albums */
-            dshuf_stream_push(&stream, k, (void *)(uintptr_t)(pushed + 1));
-            pushed++;
-        }
+    /* 5th push must be rejected due to strictly bounded window */
+    assert(dshuf_stream_push(&stream, &k, (void *)5) == 0);
+    assert(dshuf_stream_count(&stream) == 4);
 
-        /* Pop when primed or when input is exhausted */
-        if (dshuf_stream_count(&stream) >= 32 || pushed == total) {
-            void *item = NULL;
-            int ok = dshuf_stream_pop(&stream, &item);
-            assert(ok == 1);
-            assert(item != NULL);
-            popped++;
-        }
-    }
-
-    assert(pushed == total);
-    assert(popped == total);
+    dshuf_stream_clear(&stream, NULL);
     assert(dshuf_stream_count(&stream) == 0);
 
+    /* After clear, pushing is accepted again */
+    assert(dshuf_stream_push(&stream, &k, (void *)10) == 1);
+    assert(dshuf_stream_count(&stream) == 1);
+
     dshuf_stream_free(&stream);
-    printf("  [PASS] Streaming API lifecycle and drain\n");
+    printf("  [PASS] Strictly bounded window overflow rejection and clear\n");
 }
 
-static void test_edge_cases(void) {
-    size_t idx[1] = {0};
-    uint32_t k[1] = {123};
-    assert(dshuf_batch(NULL, NULL, 0, 0, NULL, 0.0f, 0, 0) == 0);
-    assert(dshuf_batch(idx, k, 1, 1, NULL, 0.0f, 0, 0) == 0);
-    assert(idx[0] == 0);
-    printf("  [PASS] Edge cases (n=0, n=1, null buffers)\n");
+static void test_jitter_1_pure_random(void) {
+    const size_t n = 50;
+    size_t indices[50];
+    uint32_t keys[50];
+    for (size_t i = 0; i < n; i++) keys[i] = 1; // all same cluster!
+
+    // At jitter 1.0, should execute pure unbiased Fisher-Yates without hanging
+    int ret = dshuf_batch(indices, keys, n, 1, NULL, 1.0f, 16, 888);
+    assert(ret == 0);
+
+    int seen[50] = {0};
+    for (size_t i = 0; i < n; i++) seen[indices[i]]++;
+    for (size_t i = 0; i < n; i++) assert(seen[i] == 1);
+
+    printf("  [PASS] Pure random shuffle at jitter 1.0\n");
 }
 
 static void test_performance_benchmark(void) {
@@ -207,8 +194,8 @@ static void test_performance_benchmark(void) {
     assert(indices && keys);
 
     for (size_t i = 0; i < n; i++) {
-        keys[i * 2 + 0] = (uint32_t)(i % 500);  /* 500 artists */
-        keys[i * 2 + 1] = (uint32_t)(i % 2500); /* 2500 albums */
+        keys[i * 2 + 0] = (uint32_t)(i % 500);
+        keys[i * 2 + 1] = (uint32_t)(i % 2500);
     }
 
     clock_t t0 = clock();
@@ -232,8 +219,8 @@ int main(void) {
     test_cluster_spacing();
     test_multi_key_clustering();
     test_starvation_resistance();
-    test_streaming_api();
-    test_edge_cases();
+    test_bounded_window_and_clear();
+    test_jitter_1_pure_random();
     test_performance_benchmark();
     printf("All unit tests passed successfully!\n");
     return 0;

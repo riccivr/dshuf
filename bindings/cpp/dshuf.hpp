@@ -16,7 +16,6 @@
 
 namespace dshuf {
 
-/* Key converter helpers */
 inline uint32_t to_key(const std::string &s) {
     return dshuf_hash_str(s.c_str());
 }
@@ -30,7 +29,6 @@ inline uint32_t to_key(T val) {
     return static_cast<uint32_t>(val);
 }
 
-/* Streaming shuffler for C++ objects */
 template <typename T>
 class Stream {
 public:
@@ -42,56 +40,53 @@ public:
         : m_num_keys(num_keys)
     {
         const float *w_ptr = weights.empty() ? nullptr : weights.data();
-        dshuf_stream_init(&m_stream, window_cap, num_keys, w_ptr, jitter, seed);
+        if (dshuf_stream_init(&m_stream, window_cap, num_keys, w_ptr, jitter, seed) != 0) {
+            m_stream.window = nullptr;
+        }
     }
 
     ~Stream() {
-        // Free any items remaining in window
-        void *p = nullptr;
-        while (dshuf_stream_pop(&m_stream, &p)) {
-            delete static_cast<T *>(p);
-        }
+        clear();
         dshuf_stream_free(&m_stream);
     }
 
-    // Non-copyable
     Stream(const Stream &) = delete;
     Stream &operator=(const Stream &) = delete;
 
-    // Movable
     Stream(Stream &&other) noexcept : m_num_keys(other.m_num_keys) {
         m_stream = other.m_stream;
         other.m_stream.window = nullptr;
-        other.m_stream.history_keys = nullptr;
+        other.m_stream.map = nullptr;
         other.m_stream.window_len = 0;
     }
 
     Stream &operator=(Stream &&other) noexcept {
         if (this != &other) {
-            void *p = nullptr;
-            while (dshuf_stream_pop(&m_stream, &p)) {
-                delete static_cast<T *>(p);
-            }
+            clear();
             dshuf_stream_free(&m_stream);
             m_num_keys = other.m_num_keys;
             m_stream = other.m_stream;
             other.m_stream.window = nullptr;
-            other.m_stream.history_keys = nullptr;
+            other.m_stream.map = nullptr;
             other.m_stream.window_len = 0;
         }
         return *this;
     }
 
-    void push(T item, const std::vector<uint32_t> &keys) {
-        T *copy = new T(std::move(item));
-        dshuf_stream_push(&m_stream, keys.data(), copy);
+    bool push(T item, const std::vector<uint32_t> &keys) {
+        if (!m_stream.window) return false;
+        std::unique_ptr<T> copy(new T(std::move(item)));
+        if (dshuf_stream_push(&m_stream, keys.data(), copy.get()) == 1) {
+            copy.release();
+            return true;
+        }
+        return false;
     }
 
     template <typename K>
-    void push(T item, K key) {
+    bool push(T item, K key) {
         uint32_t k = to_key(key);
-        T *copy = new T(std::move(item));
-        dshuf_stream_push(&m_stream, &k, copy);
+        return push(std::move(item), std::vector<uint32_t>{k});
     }
 
     bool pop(T &out_item) {
@@ -103,6 +98,13 @@ public:
             return true;
         }
         return false;
+    }
+
+    void clear() {
+        void *p = nullptr;
+        while (dshuf_stream_pop(&m_stream, &p)) {
+            delete static_cast<T *>(p);
+        }
     }
 
     size_t count() const {
@@ -118,7 +120,6 @@ private:
     dshuf_stream_t m_stream;
 };
 
-/* In-place container shuffle with single-key extractor */
 template <typename RandomIt, typename KeyFunc>
 void shuffle(RandomIt first, RandomIt last, KeyFunc key_fn,
              float jitter = DSHUF_DEFAULT_JITTER,
@@ -146,7 +147,6 @@ void shuffle(RandomIt first, RandomIt last, KeyFunc key_fn,
     std::move(tmp.begin(), tmp.end(), first);
 }
 
-/* In-place container shuffle with multi-key extractor */
 template <typename RandomIt, typename MultiKeyFunc>
 void shuffle_multi(RandomIt first, RandomIt last, size_t num_keys,
                   MultiKeyFunc multi_key_fn,

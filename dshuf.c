@@ -1,5 +1,5 @@
-﻿/*
- * dshuf - Suckless multi-key low-discrepancy shuffler
+/*
+ * dshuf - Suckless multi-key balanced shuffler
  * See LICENSE file for copyright and license details.
  */
 
@@ -23,9 +23,8 @@
 
 #include "arg.h"
 
-#if defined(_WIN32) || defined(_WIN64)
 static ssize_t
-portable_getline(char **lineptr, size_t *n, FILE *stream)
+portable_getdelim(char **lineptr, size_t *n, int delim, FILE *stream)
 {
 	char *buf;
 	size_t pos = 0;
@@ -63,7 +62,7 @@ portable_getline(char **lineptr, size_t *n, FILE *stream)
 			*n = new_size;
 		}
 		buf[pos++] = (char)c;
-		if (c == '\n')
+		if (c == delim)
 			break;
 	}
 
@@ -73,8 +72,6 @@ portable_getline(char **lineptr, size_t *n, FILE *stream)
 	buf[pos] = '\0';
 	return (ssize_t)pos;
 }
-#define getline portable_getline
-#endif
 
 char *argv0;
 
@@ -133,7 +130,6 @@ get_default_seed(void)
 		fclose(f);
 	}
 
-	/* Fallback to clock and address entropy */
 	struct timespec ts;
 #if defined(CLOCK_REALTIME)
 	if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
@@ -191,7 +187,7 @@ extract_keys(const char *line, size_t line_len, uint32_t *out_keys)
 			if (current_field == target_field) {
 				fstart = pos;
 				while (pos < line_len && line[pos] != opt_delim &&
-				       line[pos] != '\n' && line[pos] != '\r') {
+				       line[pos] != '\n' && line[pos] != '\r' && line[pos] != '\0') {
 					pos++;
 				}
 				flen = pos - fstart;
@@ -228,35 +224,42 @@ process_streaming(FILE **files, int num_files)
 	ssize_t nread;
 	long emitted = 0;
 	uint32_t keys[DSHUF_MAX_KEYS];
+	int term_delim = opt_zero_term ? '\0' : '\n';
 
 	for (int f = 0; f < num_files; f++) {
 		FILE *fp = files[f];
-		while ((nread = getline(&line, &line_cap, fp)) != -1) {
-			/* Strip trailing newline if any for clean storage */
-			while (nread > 0 && (line[nread - 1] == '\n' || line[nread - 1] == '\r')) {
+		while ((nread = portable_getdelim(&line, &line_cap, term_delim, fp)) != -1) {
+			/* Strip trailing delimiter if present */
+			if (nread > 0 && line[nread - 1] == term_delim) {
+				line[--nread] = '\0';
+			}
+			/* Also strip CR if CRLF */
+			if (!opt_zero_term && nread > 0 && line[nread - 1] == '\r') {
 				line[--nread] = '\0';
 			}
 
 			extract_keys(line, (size_t)nread, keys);
 
-			char *dup = strdup(line);
-			if (!dup) die("%s: out of memory", argv0);
-
-			if (dshuf_stream_push(&stream, keys, dup) != 0) {
-				die("%s: failed to push into stream", argv0);
-			}
-
+			/* Pop items if window reached capacity to preserve strict O(W) memory */
 			while (dshuf_stream_count(&stream) >= opt_window) {
 				void *p = NULL;
 				if (dshuf_stream_pop(&stream, &p) && p) {
 					fputs((char *)p, stdout);
-					fputc(opt_zero_term ? '\0' : '\n', stdout);
+					fputc(term_delim, stdout);
 					free(p);
 					emitted++;
 					if (opt_limit >= 0 && emitted >= opt_limit) {
 						goto done;
 					}
 				}
+			}
+
+			char *dup = strdup(line);
+			if (!dup) die("%s: out of memory", argv0);
+
+			if (dshuf_stream_push(&stream, keys, dup) <= 0) {
+				free(dup);
+				die("%s: stream push failed", argv0);
 			}
 		}
 	}
@@ -266,7 +269,7 @@ process_streaming(FILE **files, int num_files)
 	while (dshuf_stream_pop(&stream, &p)) {
 		if (p) {
 			fputs((char *)p, stdout);
-			fputc(opt_zero_term ? '\0' : '\n', stdout);
+			fputc(term_delim, stdout);
 			free(p);
 			emitted++;
 			if (opt_limit >= 0 && emitted >= opt_limit) {
@@ -277,6 +280,8 @@ process_streaming(FILE **files, int num_files)
 
 done:
 	free(line);
+	/* Clear and free any items left in the window (e.g. if limit -n triggered early exit) */
+	dshuf_stream_clear(&stream, free);
 	dshuf_stream_free(&stream);
 }
 
@@ -292,11 +297,15 @@ process_batch(FILE **files, int num_files)
 	char *line = NULL;
 	size_t line_cap = 0;
 	ssize_t nread;
+	int term_delim = opt_zero_term ? '\0' : '\n';
 
 	for (int f = 0; f < num_files; f++) {
 		FILE *fp = files[f];
-		while ((nread = getline(&line, &line_cap, fp)) != -1) {
-			while (nread > 0 && (line[nread - 1] == '\n' || line[nread - 1] == '\r')) {
+		while ((nread = portable_getdelim(&line, &line_cap, term_delim, fp)) != -1) {
+			if (nread > 0 && line[nread - 1] == term_delim) {
+				line[--nread] = '\0';
+			}
+			if (!opt_zero_term && nread > 0 && line[nread - 1] == '\r') {
 				line[--nread] = '\0';
 			}
 
@@ -348,7 +357,7 @@ process_batch(FILE **files, int num_files)
 	for (size_t i = 0; i < emit_count; i++) {
 		size_t idx = indices[i];
 		fputs(lines[idx], stdout);
-		fputc(opt_zero_term ? '\0' : '\n', stdout);
+		fputc(term_delim, stdout);
 	}
 
 	for (size_t i = 0; i < count; i++) {
